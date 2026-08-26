@@ -29,14 +29,26 @@ let popcount = Int64.popcount
 type t =
   { mutable seed : int64
   ; odd_gamma : int64
+  ; mutable intercept : intercept option
+  }
+
+and intercept =
+  { int64 :
+      t -> lo:int64 -> hi:int64 -> default:(t -> lo:int64 -> hi:int64 -> int64) -> int64
+  ; float :
+      t -> lo:float -> hi:float -> default:(t -> lo:float -> hi:float -> float) -> float
+  ; unit_float : t -> default:(t -> float) -> float
+  ; bool : t -> default:(t -> bool) -> bool
+  ; on_split : unit -> intercept option
+  ; on_perturb : int -> intercept option
   }
 
 (* Alias used below when [t] is shadowed. *)
 type state = t
 
 let golden_gamma = 0x9e37_79b9_7f4a_7c15L
-let of_int seed = { seed = Int64.of_int seed; odd_gamma = golden_gamma }
-let copy { seed; odd_gamma } = { seed; odd_gamma }
+let of_int seed = { seed = Int64.of_int seed; odd_gamma = golden_gamma; intercept = None }
+let copy { seed; odd_gamma; intercept } = { seed; odd_gamma; intercept }
 let mix_bits z n = z lxor (z lsr n)
 
 let mix64 z =
@@ -80,7 +92,7 @@ let next_seed t =
 let of_seed_and_gamma ~seed ~gamma =
   let seed = mix64 seed in
   let odd_gamma = mix_odd_gamma gamma in
-  { seed; odd_gamma }
+  { seed; odd_gamma; intercept = None }
 ;;
 
 let random_int64 random_state =
@@ -94,9 +106,16 @@ let create random_state =
 ;;
 
 let split t =
+  let intercept =
+    match t.intercept with
+    | None -> None
+    | Some intercept -> intercept.on_split ()
+  in
   let seed = next_seed t in
   let gamma = next_seed t in
-  of_seed_and_gamma ~seed ~gamma
+  let child = of_seed_and_gamma ~seed ~gamma in
+  child.intercept <- intercept;
+  child
 ;;
 
 let next_int64 t = mix64 (next_seed t)
@@ -104,11 +123,23 @@ let next_int64 t = mix64 (next_seed t)
 (* [perturb] is not from any external source, but provides a way to mix in external
    entropy with a pseudo-random state. *)
 let perturb t salt =
+  (match t.intercept with
+   | None -> ()
+   | Some intercept ->
+     (match intercept.on_perturb salt with
+      | None -> ()
+      | Some replacement -> t.intercept <- Some replacement));
   let next = t.seed + mix64 (Int64.of_int salt) in
   t.seed <- next
 ;;
 
-let bool state = is_odd (next_int64 state)
+let bool_default state = is_odd (next_int64 state)
+
+let bool state =
+  match state.intercept with
+  | None -> bool_default state
+  | Some intercept -> intercept.bool state ~default:bool_default
+;;
 
 (* We abuse terminology and refer to individual values as biased or unbiased.  More
    properly, what is unbiased is the sampler that results if we keep only these "unbiased"
@@ -143,7 +174,7 @@ let%test_unit "remainder_is_unbiased" =
 (* This implementation of bounded randomness is adapted from [Random.State.int*] in the
    OCaml standard library.  The purpose is to use the minimum number of calls to
    [next_int64] to produce a number uniformly chosen within the given range. *)
-let int64 =
+let int64_default =
   let open Int64.O in
   let rec between state ~lo ~hi =
     let draw = next_int64 state in
@@ -169,6 +200,14 @@ let int64 =
     else if diff >= 0L
     then non_negative_up_to state diff + lo
     else between state ~lo ~hi
+;;
+
+let int64 state ~lo ~hi =
+  if lo > hi
+  then Error.raise_s [%message "int64: crossed bounds" (lo : int64) (hi : int64)];
+  match state.intercept with
+  | None -> int64_default state ~lo ~hi
+  | Some intercept -> intercept.int64 state ~lo ~hi ~default:int64_default
 ;;
 
 let int state ~lo ~hi =
@@ -223,7 +262,13 @@ let%test_unit "unit_float_from_int64" =
   assert (unit_float_from_int64 0xffff_ffff_ffff_ffffL = 1.0 -. double_ulp)
 ;;
 
-let unit_float state = unit_float_from_int64 (next_int64 state)
+let unit_float_default state = unit_float_from_int64 (next_int64 state)
+
+let unit_float state =
+  match state.intercept with
+  | None -> unit_float_default state
+  | Some intercept -> intercept.unit_float state ~default:unit_float_default
+;;
 
 (* Note about roundoff error:
 
@@ -233,16 +278,16 @@ let unit_float state = unit_float_from_int64 (next_int64 state)
    with [x < 1.] such that [lo +. x *. (hi -. lo) = hi], so it would not be correct to
    document this as being exclusive of [hi].
 *)
-let float =
+let float_default =
   let rec finite_float state ~lo ~hi =
     let range = hi -. lo in
     if Float.is_finite range
-    then lo +. (unit_float state *. range)
+    then lo +. (unit_float_default state *. range)
     else (
       (* If [hi - lo] is infinite, then [hi + lo] is finite because [hi] and [lo] have
          opposite signs. *)
       let mid = (hi +. lo) /. 2. in
-      if bool state
+      if bool_default state
          (* Depending on rounding, the recursion with [~hi:mid] might be inclusive of [mid],
          which would mean the two cases overlap on [mid]. The alternative is to increment
          or decrement [mid] using [one_ulp] in either of the calls, but then if the first
@@ -258,6 +303,17 @@ let float =
     if Float.( > ) lo hi
     then raise_s [%message "float: bounds are crossed" (lo : float) (hi : float)];
     finite_float state ~lo ~hi
+;;
+
+let float state ~lo ~hi =
+  if not (Float.is_finite lo && Float.is_finite hi)
+  then
+    raise_s [%message "float: bounds are not finite numbers" (lo : float) (hi : float)];
+  if Float.( > ) lo hi
+  then raise_s [%message "float: bounds are crossed" (lo : float) (hi : float)];
+  match state.intercept with
+  | None -> float_default state ~lo ~hi
+  | Some intercept -> intercept.float state ~lo ~hi ~default:float_default
 ;;
 
 let%bench_fun "unit_float_from_int64" =
@@ -376,6 +432,111 @@ module Log_uniform = struct
   let int64 = For_int64.log_uniform
   let nativeint = For_nativeint.log_uniform
 end
+
+module Intercept = struct
+  type state = t
+
+  type t = intercept =
+    { int64 :
+        state
+        -> lo:int64
+        -> hi:int64
+        -> default:(state -> lo:int64 -> hi:int64 -> int64)
+        -> int64
+    ; float :
+        state
+        -> lo:float
+        -> hi:float
+        -> default:(state -> lo:float -> hi:float -> float)
+        -> float
+    ; unit_float : state -> default:(state -> float) -> float
+    ; bool : state -> default:(state -> bool) -> bool
+    ; on_split : unit -> t option
+    ; on_perturb : int -> t option
+    }
+
+  let create
+    ?(int64 = fun state ~lo ~hi ~default -> default state ~lo ~hi)
+    ?(float = fun state ~lo ~hi ~default -> default state ~lo ~hi)
+    ?(unit_float = fun state ~default -> default state)
+    ?(bool = fun state ~default -> default state)
+    ?(on_split = fun () -> None)
+    ?(on_perturb = fun _ -> None)
+    ()
+    =
+    { int64; float; unit_float; bool; on_split; on_perturb }
+  ;;
+end
+
+let with_intercept t intercept = { t with intercept = Some intercept }
+
+let%test_unit "interception observes bounded draws and can force values" =
+  let observed = ref [] in
+  let intercept : Intercept.t =
+    Intercept.create
+      ~int64:(fun _ ~lo ~hi ~default:_ ->
+        observed := (lo, hi) :: !observed;
+        lo)
+      ~bool:(fun _ ~default:_ -> false)
+      ()
+  in
+  let state = with_intercept (of_int 1) intercept in
+  [%test_result: int] (int state ~lo:42 ~hi:1_000) ~expect:42;
+  [%test_result: bool] (bool state) ~expect:false;
+  [%test_result: (int64 * int64) list] !observed ~expect:[ 42L, 1_000L ]
+;;
+
+let%test_unit "interception preserves invalid-bound errors" =
+  let called = ref false in
+  let intercept : Intercept.t =
+    Intercept.create
+      ~int64:(fun _ ~lo ~hi:_ ~default:_ ->
+        called := true;
+        lo)
+      ~float:(fun _ ~lo ~hi:_ ~default:_ ->
+        called := true;
+        lo)
+      ()
+  in
+  let state = with_intercept (of_int 1) intercept in
+  let raises f = match f () with _ -> false | exception _ -> true in
+  [%test_result: bool]
+    (raises (fun () -> int64 state ~lo:1L ~hi:0L))
+    ~expect:true;
+  [%test_result: bool]
+    (raises (fun () -> float state ~lo:1. ~hi:0.))
+    ~expect:true;
+  [%test_result: bool]
+    (raises (fun () -> float state ~lo:0. ~hi:Float.infinity))
+    ~expect:true;
+  [%test_result: bool] !called ~expect:false
+;;
+
+let%test_unit "split and perturb propagate interception" =
+  let splits = ref 0 in
+  let salts = ref [] in
+  let forcing_hi =
+    Intercept.create ~int64:(fun _ ~lo:_ ~hi ~default:_ -> hi) ()
+  in
+  let rec forcing_lo () : Intercept.t =
+    Intercept.create
+      ~int64:(fun _ ~lo ~hi:_ ~default:_ -> lo)
+      ~on_split:(fun () ->
+        Int.incr splits;
+        Some (forcing_lo ()))
+      ~on_perturb:(fun salt ->
+        salts := salt :: !salts;
+        Some forcing_hi)
+      ()
+  in
+  let state = with_intercept (of_int 1) (forcing_lo ()) in
+  let child = split state in
+  [%test_result: int] !splits ~expect:1;
+  [%test_result: int] (int child ~lo:7 ~hi:99) ~expect:7;
+  perturb child 42;
+  [%test_result: int list] !salts ~expect:[ 42 ];
+  [%test_result: int] (int child ~lo:7 ~hi:99) ~expect:99
+;;
 
 module State = struct
   type t = state

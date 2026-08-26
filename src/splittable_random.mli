@@ -44,6 +44,38 @@ val copy : t -> t
     [t], i.e., [t] will return different values than if this hadn't been called. *)
 val split : t -> t
 
+(** Optional interception hooks for tools that record or replay bounded draws. States
+    without an interceptor use the ordinary draw path. *)
+module Intercept : sig
+  type state := t
+
+  type t
+
+  val create
+    :  ?int64:
+         (state
+          -> lo:int64
+          -> hi:int64
+          -> default:(state -> lo:int64 -> hi:int64 -> int64)
+          -> int64)
+    -> ?float:
+         (state
+          -> lo:float
+          -> hi:float
+          -> default:(state -> lo:float -> hi:float -> float)
+          -> float)
+    -> ?unit_float:(state -> default:(state -> float) -> float)
+    -> ?bool:(state -> default:(state -> bool) -> bool)
+    -> ?on_split:(unit -> t option)
+    -> ?on_perturb:(int -> t option)
+    -> unit
+    -> t
+end
+
+(** Return a copy of [t] whose draws consult [intercept]. [copy] preserves the
+    interceptor; [split] and [perturb] propagate it according to its callbacks. *)
+val with_intercept : t -> Intercept.t -> t
+
 (** Legacy aliases for the preceding definitions. *)
 module State : sig
   type nonrec t = t

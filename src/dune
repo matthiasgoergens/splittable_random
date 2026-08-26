@@ -2,5 +2,6 @@
  (name splittable_random)
  (public_name splittable_random)
  (libraries base)
+ (inline_tests)
  (preprocess
   (pps ppx_assert ppx_bench ppx_inline_test ppx_sexp_message)))
